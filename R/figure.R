@@ -1,210 +1,345 @@
 library(terra)
 library(tidyterra)
-library(tidyverse)
+library(dplyr)
 library(rgbif)
-library(gstat)
-library(automap)
+library(geodata)
 library(ranger)
-library(sf)
-library(stars)
+library(sdmTMB)
+library(biscale)
+library(ggplot2)
+library(tidyverse)
 
-# 1. Define Core Parameters
-hosts <- c("Rattus norvegicus", "Apodemus agrarius", "Crocidura lasiura")
-viruses <- c("Orthohantavirus hantanense", "Orthohantavirus seoulense")
-bounds <- ext(125.8, 129.8, 33.0, 38.6)
+# 1. Environmental Data Acquisition
+# Retrieve the boundary and bioclimatic variables for South Korea
+kor_boundary <- geodata::gadm("KOR",
+                              level = 0,
+                              path = tempdir())
 
-# 2. Geodata Acquisition and Spatial Harmonisation
-kor_polygon <- geodata::gadm("KOR",
-                             level = 0,
-                             path = tempdir())
+clim_data <- geodata::worldclim_country("KOR",
+                                        var = "bio",
+                                        res = 2.5,
+                                        path = tempdir()) |>
+  terra::mask(kor_boundary)
 
-prk_polygon <- geodata::gadm("PRK",
-                             level = 0,
-                             path = tempdir())
+# Clean names for modelling compatibility
+names(clim_data) <- paste0("bio_", 1:19)
 
-# Extract bioclimatic variables and mask to South Korea
-env_layers <- geodata::worldclim_country("KOR",
-                                         var = "bio",
-                                         path = tempdir()) |>
-  crop(kor_polygon) |>
-  mask(kor_polygon)
+# 2. Host Species Distribution Model (Apodemus agrarius)
+# Retrieve occurrence data and format as a SpatVector
+host_occ <- rgbif::occ_data(scientificName = "Apodemus agrarius",
+                            country = "KR",
+                            hasCoordinate = TRUE,
+                            limit = 2000)$data |>
+  dplyr::select(decimalLongitude,
+                decimalLatitude) |>
+  terra::vect(geom = c("decimalLongitude", "decimalLatitude"),
+              crs = "EPSG:4326")
 
-# 3. GBIF Occurrence Ingestion
-taxon_keys <- hosts |>
-  lapply(function(x) name_backbone(name = x)$usageKey) |>
-  unlist()
+# Generate pseudo-absences and extract environmental covariates
+bg_points <- terra::spatSample(kor_boundary,
+                               size = 5000,
+                               method = "random")
 
-download_req <- occ_download(
-  pred_in("taxonKey", taxon_keys),
-  pred("country", "KR"),
-  pred("hasCoordinate", TRUE),
-  pred("hasGeospatialIssue", FALSE),
-  format = "SIMPLE_CSV")
+occ_extract <- terra::extract(clim_data, host_occ) |>
+  dplyr::mutate(presence = 1)
+bg_extract <- terra::extract(clim_data, bg_points) |>
+  dplyr::mutate(presence = 0)
 
-occ_download_wait(download_req)
+sdm_data <- dplyr::bind_rows(occ_extract,
+                             bg_extract) |>
+  dplyr::select(-ID) |>
+  stats::na.omit() |>
+  dplyr::mutate(presence = as.factor(presence))
 
-occ_records <- as.character(download_req) |>
-  occ_download_get(overwrite = TRUE) |>
-  occ_download_import()
+# Fit Random Forest SDM and predict to the raster extent
+rf_model <- ranger::ranger(presence ~ .,
+                           data = sdm_data,
+                           probability = TRUE)
 
-occ_filtered <- occ_records |>
-  filter(!is.na(decimalLongitude),
-         decimalLongitude > 100,
-         species %in% hosts)
-
-# 4. Species Distribution Modelling (SDM) 
-fit_sdm <- function(species_data,
-                    predictors,
-                    n_bg = 5000) {
-  
-  # 1. Format presence data and extract environmental covariates
-  pres_pts <- vect(species_data,
-                   geom = c("decimalLongitude", "decimalLatitude"),
-                   crs = crs(predictors))
-  
-  pres_env <- terra::extract(predictors, pres_pts, ID = FALSE) |>
-    mutate(presence = 1) |>
-    na.omit()
-  
-  # 2. Sample background (pseudo-absences) directly from valid raster cells
-  bg_env <- spatSample(predictors,
-                       size = n_bg,
-                       na.rm = TRUE,
-                       xy = FALSE,
-                       values = TRUE) |>
-    mutate(presence = 0)
-  
-  model_df <- bind_rows(pres_env, bg_env)
-  
-  # 3. Fit the Random Forest
-  # keep.inbag = TRUE is strictly required to calculate spatial standard errors later
-  rf_model <- ranger(presence ~ .,
-                     data = model_df,
-                     num.trees = 500,
-                     keep.inbag = TRUE)
-  
-  # 4. Custom prediction wrapper for terra::predict
-  # Extracts both the mean prediction and the standard error
-  pred_fun <- function(model, data) {
-    p <- predict(model, data = data, type = "se")
-    cbind(p$predictions, p$se)
-  }
-  
-  # 5. Project across the environmental layers
-  predict(predictors,
-          rf_model,
-          fun = pred_fun,
-          na.rm = TRUE) |>
-    setNames(c("prediction", "uncertainty"))
+# Custom prediction function for terra::predict with ranger probability outputs
+pred_fun <- function(model, data) {
+  predict(model, data)$predictions[, 2]
 }
 
-sdms <- map(hosts,
-            ~ fit_sdm(occ_filtered[occ_filtered$species == .x, ], env_layers)) |>
-  setNames(hosts)
+host_sdm_raster <- terra::predict(clim_data,
+                                  rf_model,
+                                  fun = pred_fun,
+                                  na.rm = TRUE)
+names(host_sdm_raster) <- "host_suitability"
 
-# 5. Spatial Kriging for Pathogen Prevalence
-arha <- readRDS("C:/Users/ucbtds4/R_Repositories/arenavirus_hantavirus/data/database/Project_ArHa_database_2026-01-09.rds")
-arha_pathogen <- arha$host |>
-  left_join(arha$pathogen, by = "host_record_id") |>
-  select(host_record_id, pathogen_record_id, host_species, iso3c, latitude, longitude, pathogen_species_cleaned, pathogen_species_ncbi, number_tested, number_positive) |>
-  filter(iso3c %in% c("KOR", "PRK"))
+# 3. Pathogen Prevalence Model (Model-Based Geostatistics)
+arha_data <- read_csv(here::here("korea_prevalence_data.csv"))
 
-hanta_agrarius_sf <- arha_pathogen |>
-  filter(pathogen_species_ncbi == "Orthohantavirus hantanense",
-         host_species == "Apodemus agrarius") |>
-  group_by(longitude, latitude) |>
-  summarise(n_tested = sum(number_tested, na.rm = TRUE),
-            n_positive = sum(number_positive, na.rm = TRUE),
-            .groups = "drop") |>
-  filter(n_tested > 0) |>
-  mutate(prevalence = n_positive / n_tested) |>
-  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+# Create the spatial mesh for the SPDE approximation
+mesh <- sdmTMB::make_mesh(arha_data,
+                          xy_cols = c("longitude", "latitude"),
+                          cutoff = 0.15)
 
-# 2. Project to match the environmental template (required for gstat)
-# Assuming env_layers was loaded in the previous step and is in a projected CRS
-hanta_agrarius_proj <- st_transform(hanta_agrarius_sf, st_crs(env_layers))
+# Fit the spatial GLMM for binomial prevalence data
+fit_spde <- sdmTMB::sdmTMB(cbind(n_positive, n_tested - n_positive) ~ 1,
+                           data = arha_data,
+                           mesh = mesh,
+                           family = binomial(link = "logit"),
+                           spatial = "on")
 
-# 3. Generate the spatial prediction and variance surfaces
-krige_prevalence <- function(data_pts,
-                             template_raster) {
-  
-  # 1. Fit the variogram
-  vgm_fit <- autofitVariogram(prevalence ~ 1,
-                              input_data = as(data_pts, "Spatial"))
-  
-  # 2. Convert to stars
-  grid_stars <- st_as_stars(template_raster)
-  
-  # 3. Perform Kriging
-  krige_out <- krige(prevalence ~ 1,
-                     locations = data_pts,
-                     newdata = grid_stars,
-                     model = vgm_fit$var_model)
-  
-  # 4. Convert to SpatRaster and subset by index, NOT by name
-  out_rast <- rast(krige_out)[[1:2]] |>
-    setNames(c("prev_predict", "prev_var"))
-  
-  return(out_rast)
+# Extract coordinate grid from the host SDM for prediction
+pred_grid <- terra::as.data.frame(host_sdm_raster,
+                                  xy = TRUE,
+                                  na.rm = TRUE) |>
+  dplyr::rename(longitude = x,
+                latitude = y)
+
+sim_draws <- predict(fit_spde, newdata = pred_grid, nsim = 100)
+
+prev_pred <- pred_grid |>
+  dplyr::mutate(est = apply(sim_draws, 1, mean),
+                uncertainty = apply(sim_draws, 1, sd),
+                prevalence_prob = stats::plogis(est))
+
+# Convert back to a SpatRaster and align with the host SDM
+uncertainty_raster <- terra::rast(prev_pred, type = "xyz", crs = "EPSG:4326") |>
+  terra::subset("uncertainty") |>
+  terra::resample(host_sdm_raster)
+
+# 4. Bivariate Mapping for Sampling Prioritisation
+# Combine rasters and convert to dataframe for biscale classification
+hazard_stack <- c(host_sdm_raster, uncertainty_raster)
+
+hazard_df <- terra::as.data.frame(hazard_stack,
+                                  xy = TRUE,
+                                  na.rm = TRUE)
+
+# Create bivariate classes (3x3 grid) based on quantiles
+biv_data <- biscale::bi_class(hazard_df,
+                              x = host_suitability,
+                              y = uncertainty,
+                              style = "quantile",
+                              dim = 4)
+
+# Generate the map
+map_plot <- ggplot2::ggplot() +
+  ggplot2::geom_tile(data = biv_data,
+                     aes(x = x, y = y, fill = bi_class),
+                     show.legend = FALSE) +
+  biscale::bi_scale_fill(pal = "DkCyan2",
+                         dim = 4) +
+  tidyterra::geom_spatvector(data = kor_boundary,
+                             fill = NA,
+                             colour = "black",
+                             linewidth = 0.3) +
+  ggplot2::coord_sf(expand = FALSE) +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(title = "Adaptive Sampling Prioritisation",
+                x = "",
+                y = "") +
+  ggplot2::theme(text = element_text(size = 7, family = "sans"))
+
+# Generate the bivariate legend
+legend <- biscale::bi_legend(pal = "DkCyan2",
+                             dim = 4,
+                             xlab = "Higher Host Suitability",
+                             ylab = "Higher Uncertainty",
+                             size = 8)
+
+# Combine map and legend using cowplot or patchwork
+panel_b <- cowplot::ggdraw() +
+  cowplot::draw_plot(map_plot, 0, 0, 1, 1) +
+  cowplot::draw_plot(legend, 0.65, 0.15, 0.25, 0.25)
+
+# 5. Extract and Smooth True 90th Percentile Target Polygons
+# Calculate the exact mathematical 90th percentiles
+suit_90 <- stats::quantile(hazard_df$host_suitability, probs = 0.90, na.rm = TRUE)
+uncert_90 <- stats::quantile(hazard_df$uncertainty, probs = 0.90, na.rm = TRUE)
+
+# Filter the raw data strictly by these thresholds, ignoring the visual 3-3 class
+target_df <- hazard_df |>
+  dplyr::filter(host_suitability >= suit_90 & uncertainty >= uncert_90) |>
+  dplyr::select(x, y, host_suitability) |>
+  dplyr::mutate(target_zone = 1) # Indicator for the raster
+
+target_rast <- terra::rast(target_df, type = "xyz", crs = "EPSG:4326")
+
+# Convert to polygons and apply morphological closing
+priority_polys <- terra::as.polygons(target_rast) |>
+  terra::buffer(width = 5000) |>
+  terra::buffer(width = -2500) |>
+  terra::mask(kor_boundary)
+
+# 6. Simulate Missing Pipeline Layers (WP1.2 & WP3.2)
+# Panel A: Multimodal AI Ingestion (3 distinct embedding layers)
+fine_rast <- terra::rast(kor_boundary, res = 0.01)
+
+# Simulate Layer 1: ViT Structural Embedding
+coarse1 <- terra::rast(kor_boundary, res = 0.05)
+terra::values(coarse1) <- stats::rnorm(terra::ncell(coarse1))
+vit_struct <- terra::resample(coarse1, fine_rast, method = "bilinear") |> terra::mask(kor_boundary)
+
+# Simulate Layer 2: ViT Phenological Shift
+coarse2 <- terra::rast(kor_boundary, res = 0.08)
+terra::values(coarse2) <- stats::runif(terra::ncell(coarse2))
+vit_pheno <- terra::resample(coarse2, fine_rast, method = "bilinear") |> terra::mask(kor_boundary)
+
+# Simulate Layer 3: NLP Agricultural Intensity
+coarse3 <- terra::rast(kor_boundary, res = 0.05)
+terra::values(coarse3) <- stats::rexp(terra::ncell(coarse3))
+nlp_agri <- terra::resample(coarse3, fine_rast, method = "bilinear") |> terra::mask(kor_boundary)
+
+# Stack and name the layers for ggplot faceting
+ai_stack <- c(vit_struct, vit_pheno, nlp_agri)
+names(ai_stack) <- c("ViT: Structural", "ViT: Phenology", "NLP: Agriculture")
+# Panel C: Logistical Constraints (Roads, Static Exclusions, Weather Mask)
+precip_raster <- clim_data[["bio_16"]]
+precip_thresh <- stats::quantile(terra::values(precip_raster), probs = 0.85, na.rm = TRUE)
+weather_mask_rast <- terra::ifel(precip_raster >= precip_thresh, 1, NA)
+dynamic_weather_mask <- terra::as.polygons(weather_mask_rast) |>
+  terra::buffer(width = 2000)
+
+# Static Exclusion: Inaccessible Mountainous Terrain (Elevation > 1000m)
+elev_data <- geodata::elevation_30s(country = "KOR", path = tempdir()) |>
+  terra::mask(kor_boundary)
+elev_mask_rast <- terra::ifel(elev_data > 1000, 1, NA)
+static_exclusion <- terra::as.polygons(elev_mask_rast) |>
+  terra::buffer(width = 1000)
+
+# Road Network & Accessibility Buffer (Major highways for reproducible plotting)
+kor_roads_sf <- rnaturalearth::ne_download(scale = 10, type = "roads", category = "cultural", returnclass = "sf") |>
+  sf::st_intersection(sf::st_as_sf(kor_boundary))
+
+roads <- terra::vect(kor_roads_sf)
+road_buffer <- terra::buffer(roads, width = 3000)
+
+# Panel D: Calculate Final Feasible Sites
+# Intersect smoothed priority targets with road access, then erase exclusions
+feasible_sites <- terra::intersect(priority_polys, road_buffer) |>
+  terra::erase(static_exclusion) |>
+  terra::erase(dynamic_weather_mask)
+
+sample_pins <- terra::spatSample(feasible_sites, size = 15, method = "random")
+
+# 7. Construct Panels A, C, D
+mainland_xlim <- c(125.7, 129.7)
+mainland_ylim <- c(34.2, 38.6)
+
+base_theme <- function() {
+  list(
+    ggplot2::coord_sf(xlim = mainland_xlim, ylim = mainland_ylim, expand = FALSE),
+    ggplot2::theme_void(),
+    ggplot2::theme(plot.title = ggplot2::element_text(size = 7, face = "bold", hjust = 0.5, family = "sans"),
+                   plot.subtitle = ggplot2::element_text(size = 6, hjust = 0.5, family = "sans"),
+                   panel.border = ggplot2::element_rect(colour = "black", fill = NA, linewidth = 0.5),
+                   plot.margin = ggplot2::margin(5, 5, 5, 5))
+  )
 }
 
-hanta_surfaces <- krige_prevalence(data_pts = hanta_agrarius_proj, 
-                                   template_raster = env_layers[[1]])
-
-w_prevalence <- 0.5
-w_dose <- 0.5
-w_uncertainty <- 1 - w_dose
-
-dose_priority <- init(env_layers[[1]], fun = 0)
-uncertainty_priority <- init(env_layers[[1]], fun = 0)
-prevalence_priority <- init(env_layers[[1]], fun = 0)
-
-# 2. Accumulate Host SDM Priorities
-for (h in hosts) {
-  P <- sdms[[h]]$prediction
-  U <- sdms[[h]]$uncertainty
-  
-  dose_priority <- dose_priority + (w_dose * P)
-  uncertainty_priority <- uncertainty_priority + (w_uncertainty * U)
+# Sub-theme for the Panel A mini-maps
+sub_theme <- function() {
+  list(
+    ggplot2::coord_sf(xlim = mainland_xlim, ylim = mainland_ylim, expand = FALSE),
+    ggplot2::theme_void(),
+    ggplot2::theme(plot.title = ggplot2::element_text(size = 5, face = "italic", hjust = 0.5),
+                   panel.border = ggplot2::element_rect(colour = "grey70", fill = NA, linewidth = 0.3),
+                   # Increasing the margins here shrinks the map relative to its bounding box (~80% size)
+                   plot.margin = ggplot2::margin(15, 12, 15, 12, "pt"))
+  )
 }
 
-# 3. Accumulate Pathogen Prevalence Priorities
-hanta_var_rescaled <- app(hanta_surfaces$prev_var, 
-                          fun = function(x) (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)))
+# Panel A: Build 3 separate plots with unique colour scales
+p_a1 <- ggplot2::ggplot() +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = "grey95", colour = NA) +
+  tidyterra::geom_spatraster(data = vit_struct, show.legend = FALSE) +
+  ggplot2::scale_fill_viridis_c(option = "magma", na.value = "transparent") +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = NA, colour = "grey30", linewidth = 0.3) +
+  ggplot2::labs(title = "ViT: Structural") +
+  sub_theme()
 
-prevalence_priority <- prevalence_priority + hanta_var_rescaled
+p_a2 <- ggplot2::ggplot() +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = "grey95", colour = NA) +
+  tidyterra::geom_spatraster(data = vit_pheno, show.legend = FALSE) +
+  ggplot2::scale_fill_viridis_c(option = "mako", na.value = "transparent") +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = NA, colour = "grey30", linewidth = 0.3) +
+  ggplot2::labs(title = "ViT: Phenology") +
+  sub_theme()
 
+p_a3 <- ggplot2::ggplot() +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = "grey95", colour = NA) +
+  tidyterra::geom_spatraster(data = nlp_agri, show.legend = FALSE) +
+  ggplot2::scale_fill_viridis_c(option = "plasma", na.value = "transparent") +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = NA, colour = "grey30", linewidth = 0.3) +
+  ggplot2::labs(title = "NLP: Agriculture") +
+  sub_theme()
 
-total_priority <- (w_prevalence * prevalence_priority) + ((1 - w_prevalence) * uncertainty_priority)
+# Stitch Panel A together, apply a grouping title and background, and wrap it
+library(patchwork)
+panel_a_raw <- (p_a1 | p_a2 | p_a3) +
+  patchwork::plot_annotation(title = "A. Multimodal AI Ingestion (WP1.2)",
+                             theme = ggplot2::theme(plot.title = ggplot2::element_text(size = 10, face = "bold", hjust = 0.5, family = "sans"),
+                                                    # Adds a subtle grey box around the 3 inputs to group them
+                                                    plot.background = ggplot2::element_rect(colour = "black", fill = "grey98", linewidth = 0.5),
+                                                    plot.margin = ggplot2::margin(5, 5, 5, 5)))
 
-total_priority <- app(total_priority, 
-                      fun = function(x) (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)))
+# Wrap elements ensures patchwork treats this entire block as a single cohesive panel in the final 2x2 grid
+panel_a <- patchwork::wrap_elements(panel_a_raw)
 
-# 7. Spatial Sampling (Active Learning Acquisition)
-# Emulating Julia's Balanced Acceptance Sampling using weighted spatSample
-bon_samples <- spatSample(total_priority,
-                          size = 50,
-                          method = "weights",
-                          replace = FALSE,
-                          as.points = TRUE)
+# Panel B: Rebuild and INSET the legend
+legend <- biscale::bi_legend(pal = "DkCyan2",
+                             dim = 4,
+                             xlab = "Suitability",
+                             ylab = "Uncertainty",
+                             size = 6) +
+  ggplot2::theme(plot.margin = ggplot2::margin(4, 4, 4, 4, "pt"), # Minimal breathing room for text
+                 plot.background = ggplot2::element_rect(fill = "white", 
+                                                         colour = "black", 
+                                                         linewidth = 0.3), # Crisp inset border
+                 panel.background = ggplot2::element_blank())
 
-# 8. Visualisation using tidyterra
-priority_plot <- ggplot() +
-  geom_spatraster(data = total_priority) +
-  scale_fill_viridis_c(option = "magma",
-                       name = "Total Priority",
-                       na.value = "transparent") +
-  geom_spatvector(data = prk_polygon,
-                  fill = "grey85",
-                  color = "grey40",
-                  linewidth = 0.5) +
-  geom_spatvector(data = bon_samples,
-                  color = "white",
-                  fill = "black",
-                  shape = 21,
-                  size = 3) +
-  coord_sf(xlim = c(bounds[1], bounds[2]),
-           ylim = c(bounds[3], bounds[4]),
-           expand = FALSE) +
-  theme_void() +
-  theme(legend.position = "bottom")
+panel_b_gg <- map_plot +
+  ggplot2::labs(title = "B. INLA-SPDE Hazard & Entropy (WP2.1)",
+                subtitle = "Host Suitability vs. Pathogen Model Uncertainty",) +
+  base_theme() +
+  patchwork::inset_element(legend, 
+                           left = 0.72,
+                           bottom = 0.02,
+                           right = 0.98,
+                           top = 0.26)
+
+# Panel C & D
+panel_c <- ggplot2::ggplot() +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = "grey95", colour = "grey50") +
+  tidyterra::geom_spatvector(data = road_buffer, fill = "#73C6B6", colour = NA, alpha = 0.5) +
+  tidyterra::geom_spatvector(data = static_exclusion, fill = "black", colour = NA, alpha = 0.6) +
+  tidyterra::geom_spatvector(data = dynamic_weather_mask, fill = "#3498DB", colour = NA, alpha = 0.5) +
+  tidyterra::geom_spatvector(data = roads, colour = "grey20", linewidth = 0.2) +
+  ggplot2::labs(title = "C. KDCA Logistics & Dynamic Masking (WP3.2)") +
+  base_theme()
+
+panel_d <- ggplot2::ggplot() +
+  tidyterra::geom_spatvector(data = kor_boundary, fill = "grey95", colour = "grey50") +
+  tidyterra::geom_spatvector(data = dynamic_weather_mask, fill = "#3498DB", colour = NA, alpha = 0.1, linetype = "dashed") +
+  tidyterra::geom_spatvector(data = feasible_sites, fill = "#F39C12", colour = "black", linewidth = 0.4) +
+  tidyterra::geom_spatvector(data = sample_pins, colour = "black", fill = "red", shape = 21, size = 1.5) +
+  ggplot2::labs(title = "D. sitetool Target Deployment (WP3.3)") +
+  base_theme()
+
+# ---------------------------------------------------------
+# 8. Assemble Final Figure (Pure Patchwork)
+# ---------------------------------------------------------
+# Using the Asymmetric Layout (Left column wider than right column)
+final_4panel_figure <- (panel_a + panel_b_gg) / (panel_c + panel_d) +
+  patchwork::plot_layout(widths = c(1.8, 1)) +
+  patchwork::plot_annotation(title = "The Active Learning Intelligence Engine",
+                             theme = ggplot2::theme(plot.title = ggplot2::element_text(size = 13, face = "bold", hjust = 0.5, family = "sans")))
+
+print(final_4panel_figure)
+
+ggplot2::ggsave(filename = "active_learning_engine.png",
+                plot = final_4panel_figure,
+                width = 17,
+                height = 19,
+                units = "cm",
+                dpi = 300,         # High resolution for grant peer review
+                bg = "white")
+
+ggplot2::ggsave(filename = here::here("figures", "panel_1.png"), plot = panel_a, width = 17, height = 19, units = "cm", dpi = 300, bg = "white")
+ggplot2::ggsave(filename = here::here("figures", "panel_2.png"), plot = panel_b_gg, width = 17, height = 19, units = "cm", dpi = 300, bg = "white")
+ggplot2::ggsave(filename = here::here("figures", "panel_3.png"), plot = panel_c, width = 17, height = 19, units = "cm", dpi = 300, bg = "white")
+ggplot2::ggsave(filename = here::here("figures", "panel_4.png"), plot = panel_d, width = 17, height = 19, units = "cm", dpi = 300, bg = "white")
